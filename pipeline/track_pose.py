@@ -1,7 +1,6 @@
 from pipeline.pipeline import Pipeline
 from pipeline.libs.pose_tracker import PoseTracker
 
-
 class TrackPose(Pipeline):
 
     def __init__(self, link_len=100, num=7, mag=30, match=0.2, orb_features=1000):

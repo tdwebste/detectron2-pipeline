@@ -13,6 +13,9 @@ from pipeline.save_video import SaveVideo
 from pipeline.utils import detectron
 from pipeline.track_pose import TrackPose
 
+import pprint
+pp = pprint.PrettyPrinter(indent=4)
+
 
 def parse_args():
     import argparse
@@ -152,4 +155,5 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
+    #pp.pprint(args)
     main(args)
