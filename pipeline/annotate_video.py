@@ -12,6 +12,8 @@ from pipeline.utils.colors import colors
 from pipeline.utils.text import put_text
 
 import math
+import time
+from operator import itemgetter
 import pprint
 pp = pprint.PrettyPrinter(indent=4)
 outfile = sys.stdout
@@ -34,19 +36,26 @@ class AnnotateVideo(Pipeline):
         self.cpu_device = torch.device("cpu")
         self.video_visualizer = VideoVisualizer(self.metadata, self.instance_mode)
 
-        self.size ={}
-        self.size['image'] = [0,0]
+        self.size = {}
+        self.size['image'] = [0,1]
         self.size['room'] = [14, 16] #size in feet
         self.size['room'][0] = self.size['room'][0]/3.28084
         self.size['room'][1] = self.size['room'][1]/3.28084
         self.size['image'][0] = 1920 #image_width in pixes
         self.size['image'][1] = 1080 #image_hieght in pixes
-        self.size['scale'] = [1,1]
+        self.size['scale'] = [0,1]
         self.size['scale'][0] = self.size['room'][0]/ self.size['image'][0]
         self.size['scale'][1] = self.size['room'][1]/ self.size['image'][1]
+        self.size['jitter'] = [0,1]
+        self.size['jitter'][0] = 7
+        self.size['jitter'][1] = 7
+
+        self.ppid = {}
 
         self.framedata = {}
         self.accu = {}
+        self.locpt = {}
+        self.locpt['person'] = {}
         self.accu['person'] = {}
         self.items = {
             'counter': [( 1100,500), (820,340)],
@@ -56,47 +65,183 @@ class AnnotateVideo(Pipeline):
             'avocado': [( 920,470), (810,380)],
         }
 
+        """ future work enabled image scaling
+        passed argument image_scale
+        self.image_scale = scaling
+
+
+        self.items = {
+            'counter': [[ 1100,500], [820,340]],
+            'doors': [[ 1150,550], [1090,400]],
+            'dish': [[ 950,330], [850,270]],
+            'gloves': [[ 950,380], [850,350]],
+            'avocado': [[ 920,470], [810,380]],
+        }
+
+
+        for axis in [0,1]:
+            self.size['image'][axis] = int(self.size['image'][axis]/self.image_scale)
+            self.size['jitter'][axis] = int(self.size['jitter'][axis]/self.image_scale)
+        pp.pprint(self.size['image'])
+
+
+        for idx, item in enumerate(self.items):
+            for axis in [0,1]:
+                self.items[item][0][axis] = int(self.items[item][0][axis]/self.image_scale)
+                self.items[item][1][axis] = int(self.items[item][1][axis]/self.image_scale)
+        pp.pprint(self.items)
+        """
+
+        #possible that evenly period = 4, 16, 32
+        self.hma_period = 16
+        self.pt_period = 4
+        self.hma = []
         super().__init__()
 
+    def first_wma(self, data, period, idx, person, axis):
+        """
+        Weighted Moving Average.
+
+        Formula:
+        (P1 + 2 P2 + 3 P3 + ... + n Pn) / K
+        where K = (1+2+...+n) = n(n+1)/2 and Pn is the most recent price
+        """
+        k = (period * (period + 1)) / 2.0
+        product = [data[idx - period + period_idx + 1] * (period_idx + 1) for period_idx in range(0, period)]
+        wma = sum(product)/k
+        return wma
+
+    def hull_moving_average(self, period, idx, person, axis):
+        #period = 4, 16, 32
+        """
+        Hull Moving Average.
+
+        Formula:
+        HMA = WMA(2*WMA(n/2) - WMA(n)), sqrt(n)
+        """
+        data = self.locpt['person'][person]['loc'][axis]
+        fwma = self.first_wma
+
+        hwma = fwma(data, int(period/2), idx, person, axis)
+        rwma = fwma(data, period, idx, person, axis)
+        return rwma
+
+        self.wma['person'][person][axis]['half'].append(hwma)
+        self.wma['person'][person][axis]['reg'].append(rwma)
+
+        if len(self.wma['person'][person][axis]['half']) < int(math.sqrt(period)) + 1:
+            return self.wma['person'][person][axis]['reg'][-1]
+        else:
+            wma1 = [2* self.wma['person'][person][axis]['half'][period_idx] - self.wma['person'][person][axis]['reg'][period_idx]
+                for period_idx in range(0,  int(math.sqrt(period))+1)]
+            print("wma1")
+            pp.pprint(wma1)
+            fwma = self.first_wma
+
+            hma = fwma(wma1, int(math.sqrt(period)), int(math.sqrt(period)), person, axis)
+            return hma
+
     def calc_movement(self):
-        for frame_pidx in sorted(self.framedata.keys()):
-            #2 or more frames
-            if len(self.framedata) > 1:
-                prevframe = self.framedata.pop(frame_pidx)
-                frame_idx = list(sorted(self.framedata.keys()))[0]
+        for frame_idx in sorted(self.framedata.keys()):
+            for person in self.framedata[frame_idx]:
+                if not person in self.locpt['person']:
+                    self.locpt['person'][person] = {}
+                    self.locpt['person'][person]['loc'] = [0,1]
+                    self.locpt['person'][person]['loc'][0] = {}
+                    self.locpt['person'][person]['loc'][1] = {}
+                    self.locpt['person'][person]['hwa']= [0,1]
+                    self.locpt['person'][person]['hwa'][0] = {}
+                    self.locpt['person'][person]['hwa'][1] = {}
+                if not person in self.accu['person']:
+                    self.accu['person'][person] = {}
+                    self.accu['person'][person]['travel_distance_meters'] = 0
+                    self.accu['person'][person]['time'] = {}
+                    self.accu['person'][person]['time']['left_arm'] = {}
+                    self.accu['person'][person]['time']['right_arm'] = {}
+                    for item in self.items:
+                        self.accu['person'][person]['time']['left_arm'][item] = 0
+                        self.accu['person'][person]['time']['right_arm'][item] = 0
+
+                if 'left_arm' in self.framedata[frame_idx][person]:
+                    for item in self.framedata[frame_idx][person]['left_arm']:
+                        self.accu['person'][person]['time']['left_arm'][item] = self.accu['person'][person]['time']['left_arm'][item] + 1;
+                if 'right_arm' in self.framedata[frame_idx][person]:
+                    for item in self.framedata[frame_idx][person]['right_arm']:
+                        self.accu['person'][person]['time']['right_arm'][item] = self.accu['person'][person]['time']['right_arm'][item] + 1;
+
+                self.locpt['person'][person]['loc'][0][frame_idx] = self.framedata[frame_idx][person]['loc'][0]
+                self.locpt['person'][person]['loc'][1][frame_idx] = self.framedata[frame_idx][person]['loc'][1]
+
+                pt_len = len(self.locpt['person'][person]['loc'][0])
+                dis = [0,1]
+                in_range = True
+                for t_idx in range (frame_idx - self.hma_period, frame_idx):
+                    if not t_idx in self.locpt['person'][person]['loc'][0]:
+                        in_range = False
+                if in_range:
+                    self.locpt['person'][person]['hwa'][0][frame_idx] = self.first_wma(self.locpt['person'][person]['loc'][0], self.hma_period, frame_idx, person, 0)
+                    self.locpt['person'][person]['hwa'][1][frame_idx] = self.first_wma(self.locpt['person'][person]['loc'][1], self.hma_period, frame_idx, person, 1)
+                    if frame_idx in self.locpt['person'][person]['hwa'][0] and (frame_idx - 1) in self.locpt['person'][person]['hwa'][0]:
+                        dis[0] = self.locpt['person'][person]['hwa'][0][frame_idx] - self.locpt['person'][person]['hwa'][0][frame_idx - 1]
+                        dis[1] = self.locpt['person'][person]['hwa'][1][frame_idx] - self.locpt['person'][person]['hwa'][1][frame_idx - 1]
+                        #print(f"hwa score:{self.framedata[frame_idx][person]['score']}")
+                        del(self.locpt['person'][person]['hwa'][0][frame_idx - 1])
+                        del(self.locpt['person'][person]['hwa'][1][frame_idx - 1])
+
+                    if len(self.locpt['person'][person]['hwa'][0]) >= self.hma_period:
+                        t_idx = sorted(self.framedata.keys())[0]
+                        del(self.locpt['person'][person]['hwa'][0][t_idx])
+                        del(self.locpt['person'][person]['hwa'][1][t_idx])
+                elif pt_len > self.pt_period+1: #box filter
+                    pt_len = len(self.locpt['person'][person]['loc'][0])
+                    pt_lowl = pt_len - (self.pt_period+1)
+                    pt_lowh = pt_len - 1
+                    pt_highl = pt_len - self.pt_period
+                    pt_highh = pt_len
+                    #print(f"frame_idx: {frame_idx} [ low: [{pt_lowl}, {pt_lowh}], high: [{pt_highl}, {pt_highh} ] score:{self.framedata[frame_idx][person]['score']}")
+                    ptot_low = [0,1]
+                    ptot_high = [0,1]
+                    ptav_low = [0,1]
+                    ptav_high = [0,1]
+                    for taxis in [0,1]:
+                        ptot_low[taxis] = 0
+                        ptot_high[taxis] = 0
+                        #handles non-continous points
+                        for cnt, tidx in enumerate(sorted(self.locpt['person'][person]['loc'][taxis])):
+                            if cnt < pt_lowl:
+                                continue
+                            elif cnt < pt_highl:
+                                ptot_low[taxis] = ptot_low[taxis] + self.locpt['person'][person]['loc'][taxis][tidx]
+                            elif cnt < pt_lowh:
+                                ptot_low[taxis] = ptot_low[taxis] + self.locpt['person'][person]['loc'][taxis][tidx]
+                                ptot_high[taxis] = ptot_high[taxis] + self.locpt['person'][person]['loc'][taxis][tidx]
+                            elif cnt < pt_highh:
+                                ptot_high[taxis] = ptot_high[taxis] + self.locpt['person'][person]['loc'][taxis][tidx]
+
+                        ptav_low[taxis] = ptot_low[taxis]/self.pt_period
+                        ptav_high[taxis] = ptot_high[taxis]/self.pt_period
+
+                        dis[taxis] = ptav_high[taxis] - ptav_low[taxis]
+
+                    if abs(dis[0]) < self.size['jitter'][0]:
+                        dis[0] = 0
+                    if abs(dis[1]) < self.size['jitter'][1]:
+                        dis[1] = 0
+                if (frame_idx - self.hma_period) in self.locpt['person'][person]['loc'][0]:
+                    del(self.locpt['person'][person]['loc'][0][frame_idx - self.hma_period])
+                    del(self.locpt['person'][person]['loc'][1][frame_idx - self.hma_period])
+
+                if abs(dis[0]) < self.size['jitter'][0]:
+                    dis[0] = 0
+                if abs(dis[1]) < self.size['jitter'][1]:
+                    dis[1] = 0
+                distance = math.sqrt(dis[0]*dis[0]*self.size['scale'][0]*self.size['scale'][0] + dis[1]*dis[1]*self.size['scale'][1]*self.size['scale'][1])
+                self.accu['person'][person]['travel_distance_meters'] = self.accu['person'][person]['travel_distance_meters'] + distance
 
 
-                for person in self.framedata[frame_idx]:
-                    if not person in self.accu['person']:
-                        self.accu['person'][person] = {}
-                        self.accu['person'][person]['travel_distance_meters'] = 0
-                        self.accu['person'][person]['time'] = {}
-                        self.accu['person'][person]['time']['left_arm'] = {}
-                        self.accu['person'][person]['time']['right_arm'] = {}
-                        for item in self.items:
-                            self.accu['person'][person]['time']['left_arm'][item] = 0
-                            self.accu['person'][person]['time']['right_arm'][item] = 0
+            prevframe = self.framedata.pop(frame_idx)
 
-                    if 'left_arm' in self.framedata[frame_idx][person]:
-                        for item in self.framedata[frame_idx][person]['left_arm']:
-                            self.accu['person'][person]['time']['left_arm'][item] = self.accu['person'][person]['time']['left_arm'][item] + 1;
-                    if 'right_arm' in self.framedata[frame_idx][person]:
-                        for item in self.framedata[frame_idx][person]['right_arm']:
-                            self.accu['person'][person]['time']['right_arm'][item] = self.accu['person'][person]['time']['right_arm'][item] + 1;
 
-                    if person in prevframe and person in  self.framedata[frame_idx]:
-                        dis = [0,0]
-                        pp.pprint(self.framedata[frame_idx][person]['loc'])
-                        dis[0] = self.framedata[frame_idx][person]['loc'][0] - prevframe[person]['loc'][0]
-                        dis[1] = self.framedata[frame_idx][person]['loc'][1] - prevframe[person]['loc'][1]
-                        # acount for frame jitter, a better way if I have time to implement would smoothing 
-                        # and the jitter needs to increase when the score decreases
-                        if dis[0] < 8:
-                            dis[0] = 0
-                        if dis[1] < 8:
-                            dis[1] = 0
-                        distance = math.sqrt(dis[0]*dis[0]*self.size['scale'][0]*self.size['scale'][0] + dis[1]*dis[1]*self.size['scale'][1]*self.size['scale'][1])
-                        self.accu['person'][person]['travel_distance_meters'] = self.accu['person'][person]['travel_distance_meters'] + distance
 
     def point_in_items(self, point):
         matches = []
@@ -179,7 +324,6 @@ class AnnotateVideo(Pipeline):
         pose_colors = list(colors.items())
         pose_colors_len = len(pose_colors)
 
-        #pp.pprint(pose_flows)
         frame_num = data["frame_num"]
 
         #work areas
@@ -188,23 +332,95 @@ class AnnotateVideo(Pipeline):
             pose_color_item = colors.get(pose_colors[pose_color_idx][0]).to_bgr()
             cv2.rectangle(dst_image, self.items[item][0], self.items[item][1], pose_color_item, 2, cv2.LINE_AA)
 
-        for idx, pose_flow in enumerate(pose_flows):
+
+        if not frame_num in self.framedata:
+            self.framedata[frame_num] = {}
+        sorted_pose = sorted(pose_flows, key=itemgetter('score'), reverse = True)
+        for idx, pose_flow in enumerate(sorted_pose):
+        #for idx, pose_flow in enumerate(pose_flows):
             pid = pose_flow["pid"]
-            if pid == 0 or pid == 1:
-                worker = {'person': pid}
-            elif 0 in self.framedata:
-                worker = {'person': 1}
-            elif 1 in self.framedata:
-                worker = {'person': 0}
-            else:
-                #lost secondary pid, pose_flow score too low, guess pid = 1
-                worker = {'person': 1}
+            #print(pid, "score:", pose_flow['score'])
+            if 0 in self.framedata[frame_num] and 1 in self.framedata[frame_num]:  # assume set known person is known in advance to be set([0, 1])
+                                        # only way people are added is at
+                                        # at the beginning of video
+                                        # or arriving through the room entrences.
+                #print("no slots avialble")
+                continue
+            elif pid in self.locpt['person']: #known person
+                if pose_flow['score'] > 2: # high score, previouly seen
+                    worker = {'person': pid}
+                elif pose_flow['score'] > .5:  # low score, previouly seen
+                    #print("score still quite low")
+                    worker = {'person': pid}
+                elif pid in self.framedata[frame_num]: #low score, and already used
+                    continue
+                elif pose_flow['score'] < .5:  # low score, previouly seen
+                    #print("know person score too low")
+                    worker = {'person': pid}
+                else:
+                    no_op = 0
+                    #print("should not be here")
+            elif pose_flow['score'] > 2:
+                if pid == 0 or pid == 1: #new addition
+                                        # assume set known person is known in advance to be set([0, 1])
+                                        # only way people are added is at
+                                        # at the beginning of video
+                                        # or arriving through the room entrences.
+                    #print("new high score person")
+                    worker = {'person': pid}
+                elif 0 in self.framedata[frame_num]: # assume set known person is known in advance to be set([0, 1])
+                                        # only way people are added is at
+                                        # at the beginning of video
+                                        # or arriving through the room entrences.
+                    worker = {'person': 1}
+                    self.ppid[pid] = 1
+                elif 1 in self.framedata[frame_num]:
+                    worker = {'person': 0}
+                    self.ppid[pid] = 0
+                elif pid in self.ppid:
+                    #print("use ppid map")
+                    worker = {'person': self.ppid[pid]}
+                else:
+                    #print("high score, and no hints")
+                    worker = {'person': 1}
+            elif pose_flow['score'] > .5:  # low score, previouly seen
+                if pid == 0 or pid == 1: #new addition
+                                        # assume set known person is known in advance to be set([0, 1])
+                                        # only way people are added is at
+                                        # at the beginning of video
+                                        # or arriving through the room entrences.
+                    #print("new score still quite low")
+                    worker = {'person': pid}
+                else:
+                    if 0 in self.framedata[frame_num]: # assume set known person is known in advance to be set([0, 1])
+                                        # only way people are added is at
+                                        # at the beginning of video
+                                        # or arriving through the room entrences.
+                        worker = {'person': 1}
+                        self.ppid[pid] = 1
+                    elif 1 in self.framedata[frame_num]:
+                        worker = {'person': 0}
+                        self.ppid[pid] = 0
+                    elif pid in self.ppid:
+                        #print("use ppid map")
+                        worker = {'person': self.ppid[pid]}
+                    else:
+                        #print("low score, and no hints")
+                        worker = {'person': 1}
+            elif pose_flow['score'] < .5:  # low score, previouly seen
+                #print("score too low")
+                continue
+
+            #print(pid, worker, "score:", pose_flow['score'])
+
 
             worker['score'] =  pose_flow["score"]
             pose_color_idx = ((pid*10) % pose_colors_len + pose_colors_len) % pose_colors_len
             pose_color_bgr = pose_colors[pose_color_idx][1].to_bgr()
             (start_x, start_y, end_x, end_y) = pose_flow["box"].astype("int")
             cv2.rectangle(dst_image, (start_x, start_y), (end_x, end_y), pose_color_bgr, 2, cv2.LINE_AA)
+            tot_x = (start_x + end_x)/2
+            tot_y = (start_y + end_y)/2
             put_text(dst_image, f"{worker['person']:d}", (start_x, start_y),
                      color=pose_color_bgr,
                      bg_color=colors.get("black").to_bgr(),
@@ -224,8 +440,6 @@ class AnnotateVideo(Pipeline):
                 p_scores[n] = score
                 cv2.circle(dst_image, (cor_x, cor_y), 2, pose_color_bgr, -1)
             # Draw limbs
-            tot_x = 0
-            tot_y = 0
             for i, (start_p, end_p) in enumerate(l_pairs):
                 if start_p in l_points and end_p in l_points:
                     start_xy = l_points[start_p]
@@ -238,14 +452,14 @@ class AnnotateVideo(Pipeline):
                         worker['left_arm'] = self.point_in_items([end_xy[0],end_xy[1]])
                     if i == 8:
                         worker['right_arm'] = self.point_in_items([end_xy[0],end_xy[1]])
-                    [tot_x, tot_y] = [tot_x + x, tot_y + y]
 
                     cv2.line(dst_image, start_xy, end_xy, pose_color_bgr, int(2 * (start_score + end_score) + 1))
 
-            worker['loc'] = [int(tot_x/i), int(tot_y/i)]
-            if not frame_num in self.framedata:
-                self.framedata[frame_num] = {}
+            worker['loc'] = [int(tot_x), int(tot_y)]
+         #   if not frame_num in self.framedata:
+         #       self.framedata[frame_num] = {}
             self.framedata[frame_num][worker['person']]  = worker
+
 
         self.calc_movement()
         pp.pprint(self.accu)
