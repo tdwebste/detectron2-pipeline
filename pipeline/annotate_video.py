@@ -46,6 +46,7 @@ class AnnotateVideo(Pipeline):
         self.size['scale'] = [0,1]
         self.size['scale'][0] = self.size['room'][0]/ self.size['image'][0]
         self.size['scale'][1] = self.size['room'][1]/ self.size['image'][1]
+        #TODO jitter should be scaled to frame fps and image resolution
         self.size['jitter'] = [0,1]
         self.size['jitter'][0] = 7
         self.size['jitter'][1] = 7
@@ -92,7 +93,9 @@ class AnnotateVideo(Pipeline):
         pp.pprint(self.items)
         """
 
-        #possible that evenly period = 4, 16, 32
+        #possible hma periods = 4, 16, 32
+        #TODO:
+        # averaging periods should be scaled with frame fps and image resolution.
         self.hma_period = 16
         self.pt_period = 4
         self.hma = []
@@ -112,7 +115,8 @@ class AnnotateVideo(Pipeline):
         return wma
 
     def hull_moving_average(self, period, idx, person, axis):
-        #period = 4, 16, 32
+        #hull moving average reduces position latence caused by averaging
+        #TODO use hull moving average so that limb position and averaged location are closely aligned.
         """
         Hull Moving Average.
 
@@ -135,7 +139,7 @@ class AnnotateVideo(Pipeline):
             wma1 = [2* self.wma['person'][person][axis]['half'][period_idx] - self.wma['person'][person][axis]['reg'][period_idx]
                 for period_idx in range(0,  int(math.sqrt(period))+1)]
             print("wma1")
-            pp.pprint(wma1)
+            #pp.pprint(wma1)
             fwma = self.first_wma
 
             hma = fwma(wma1, int(math.sqrt(period)), int(math.sqrt(period)), person, axis)
@@ -162,6 +166,7 @@ class AnnotateVideo(Pipeline):
                         self.accu['person'][person]['time']['left_arm'][item] = 0
                         self.accu['person'][person]['time']['right_arm'][item] = 0
 
+                #Count frames limb interacting with defined kitchen item areas
                 if 'left_arm' in self.framedata[frame_idx][person]:
                     for item in self.framedata[frame_idx][person]['left_arm']:
                         self.accu['person'][person]['time']['left_arm'][item] = self.accu['person'][person]['time']['left_arm'][item] + 1;
@@ -172,6 +177,17 @@ class AnnotateVideo(Pipeline):
                 self.locpt['person'][person]['loc'][0][frame_idx] = self.framedata[frame_idx][person]['loc'][0]
                 self.locpt['person'][person]['loc'][1][frame_idx] = self.framedata[frame_idx][person]['loc'][1]
 
+                #determine average person position
+                #Experments determine the best apporch.
+                # 2 apporaches are used here.
+
+                # Weighted Moving average, which assumed continuous seqeunce of frames
+                #    Has less delay by averaging the box car filter.
+                # box car averaging filter which does not assume a continuous sequence of frames.
+                #    The box car averaging filter is more suited for gaps in video frame sequence.
+                #    But causes more delay by averaging.
+
+                # Hull weight average weight average has the least delay, but is the most sensative to video frame gaps.
                 pt_len = len(self.locpt['person'][person]['loc'][0])
                 dis = [0,1]
                 in_range = True
